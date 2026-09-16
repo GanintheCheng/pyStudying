@@ -1,0 +1,23 @@
+{
+  "students": [
+    {
+      "student_id": 1,
+      "profile": {"age": 22, "city": "北京"},
+      "courses": [
+        {"name": "深度学习", "score": 88},
+        {"name": "算法", "score": 92}
+      ],
+      "passed": 1
+    },
+    {
+      "student_id": 2,
+      "profile": {"age": 21, "city": "上海"},
+      "courses": [
+        {"name": "深度学习", "score": 55},
+        {"name": "算法", "score": 60},
+        {"name": "数据库", "score": 58}
+      ],
+      "passed": 0
+    }
+  ]
+}
