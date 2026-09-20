@@ -12,7 +12,6 @@ encoded = tokenizer(
     padding=True,
     truncation=True,
     max_length=16,
-    return_tensors="pt",
 )
 
 print("input_ids:")
