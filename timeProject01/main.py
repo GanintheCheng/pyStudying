@@ -1141,3 +1141,353 @@ print(
     .head(10)
     .round(2)
 )
+
+import torch.nn.functional as F
+
+
+# ============================================================
+# 33. TCN 的基础模块
+# ============================================================
+
+class Chomp1d(nn.Module):
+    """
+    删除卷积右侧的 padding，
+    使当前时刻只能使用当前及过去信息。
+    """
+
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        if self.chomp_size == 0:
+            return x
+
+        return x[:, :, :-self.chomp_size]
+
+
+class TemporalBlock(nn.Module):
+    """
+    一个 TCN Block：
+    两层因果膨胀卷积 + ReLU + Dropout + 残差连接
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        dilation,
+        dropout,
+    ):
+        super().__init__()
+
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+        )
+
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+        )
+
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        # 若输入、输出通道不同，用 1×1 卷积匹配残差形状
+        if in_channels != out_channels:
+            self.residual = nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+            )
+        else:
+            self.residual = nn.Identity()
+
+        self.final_relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.chomp1(out)
+        out = self.relu1(out)
+        out = self.dropout1(out)
+
+        out = self.conv2(out)
+        out = self.chomp2(out)
+        out = self.relu2(out)
+        out = self.dropout2(out)
+
+        residual = self.residual(x)
+
+        return self.final_relu(out + residual)
+
+
+# ============================================================
+# 34. TCN 预测模型
+# ============================================================
+
+class TCNWithFutureKnown(nn.Module):
+    def __init__(
+        self,
+        historical_feature_size,
+        future_feature_size,
+        channels=(16, 16, 16),
+        kernel_size=3,
+        dropout=0.2,
+    ):
+        super().__init__()
+
+        blocks = []
+        in_channels = historical_feature_size
+
+        for block_index, out_channels in enumerate(channels):
+            dilation = 2 ** block_index
+
+            block = TemporalBlock(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                dropout=dropout,
+            )
+
+            blocks.append(block)
+            in_channels = out_channels
+
+        self.tcn = nn.Sequential(*blocks)
+
+        self.output_layer = nn.Linear(
+            channels[-1] + future_feature_size,
+            1,
+        )
+
+    def forward(self, x, future_known):
+        """
+        x:            (batch_size, 14, 11)
+        future_known: (batch_size, 1, 10)
+        """
+
+        # Conv1d 要求：(batch_size, channels, time_length)
+        x = x.transpose(1, 2)
+        # (batch_size, 11, 14)
+
+        features = self.tcn(x)
+        # (batch_size, 16, 14)
+
+        # 最后一个时间位置汇总过去 14 天信息
+        last_feature = features[:, :, -1]
+        # (batch_size, 16)
+
+        future_vector = future_known.squeeze(1)
+        # (batch_size, 10)
+
+        combined = torch.cat(
+            [last_feature, future_vector],
+            dim=1,
+        )
+        # (batch_size, 26)
+
+        prediction = self.output_layer(combined)
+        # (batch_size, 1)
+
+        return prediction.unsqueeze(1)
+        # (batch_size, 1, 1)
+
+
+# ============================================================
+# 35. 检查 TCN 输出形状
+# ============================================================
+
+torch.manual_seed(42)
+
+tcn_model = TCNWithFutureKnown(
+    historical_feature_size=len(historical_columns),
+    future_feature_size=len(future_known_columns_plan),
+    channels=(16, 16, 16),
+    kernel_size=3,
+    dropout=0.2,
+).to(device)
+
+print("\n===== TCN 模型 =====")
+print(tcn_model)
+
+with torch.no_grad():
+    tcn_demo_prediction = tcn_model(
+        batch_x.to(device),
+        batch_future.to(device),
+    )
+
+print("\n===== TCN 输出形状 =====")
+plan_batch_x, plan_batch_future, plan_batch_y = next(iter(train_loader_plan))
+
+tcn_demo_prediction = tcn_model(
+    plan_batch_x.to(device),
+    plan_batch_future.to(device),
+)
+
+print("prediction:", tcn_demo_prediction.shape)
+print("target:    ", plan_batch_y.shape)
+
+# ============================================================
+# 36. 训练 TCN
+# ============================================================
+
+torch.manual_seed(42)
+
+tcn_model = TCNWithFutureKnown(
+    historical_feature_size=len(historical_columns),
+    future_feature_size=len(future_known_columns_plan),
+    channels=(16, 16, 16),
+    kernel_size=3,
+    dropout=0.2,
+).to(device)
+
+tcn_criterion = nn.MSELoss()
+
+tcn_optimizer = torch.optim.AdamW(
+    tcn_model.parameters(),
+    lr=0.001,
+    weight_decay=1e-4,
+)
+
+tcn_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    tcn_optimizer,
+    mode="min",
+    factor=0.5,
+    patience=8,
+)
+
+max_epochs = 100
+early_stopping_patience = 15
+
+best_tcn_val_loss = float("inf")
+best_tcn_state = None
+wait = 0
+
+for epoch in range(max_epochs):
+    tcn_model.train()
+
+    total_train_loss = 0.0
+    total_train_samples = 0
+
+    for batch_x, batch_future, batch_y in train_loader_plan:
+        batch_x = batch_x.to(device)
+        batch_future = batch_future.to(device)
+        batch_y = batch_y.to(device)
+
+        tcn_optimizer.zero_grad()
+
+        prediction = tcn_model(batch_x, batch_future)
+        loss = tcn_criterion(prediction, batch_y)
+
+        loss.backward()
+        tcn_optimizer.step()
+
+        batch_size_now = batch_y.size(0)
+        total_train_loss += loss.item() * batch_size_now
+        total_train_samples += batch_size_now
+
+    train_loss = total_train_loss / total_train_samples
+
+    val_loss = evaluate_loss(
+        tcn_model,
+        val_loader_plan,
+        tcn_criterion,
+        device,
+    )
+
+    tcn_scheduler.step(val_loss)
+
+    if val_loss < best_tcn_val_loss:
+        best_tcn_val_loss = val_loss
+        best_tcn_state = copy.deepcopy(tcn_model.state_dict())
+        wait = 0
+    else:
+        wait += 1
+
+    if epoch % 10 == 0 or epoch == max_epochs - 1:
+        current_lr = tcn_optimizer.param_groups[0]["lr"]
+
+        print(
+            f"TCN epoch={epoch:03d}, "
+            f"train_loss={train_loss:.6f}, "
+            f"val_loss={val_loss:.6f}, "
+            f"lr={current_lr:.6f}, "
+            f"wait={wait}"
+        )
+
+    if wait >= early_stopping_patience:
+        print(f"TCN 提前停止于 epoch {epoch}")
+        break
+
+tcn_model.load_state_dict(best_tcn_state)
+
+print("\n===== TCN 训练完成 =====")
+print(f"最佳验证集 MSE（标准化尺度）: {best_tcn_val_loss:.6f}")
+print(f"实际训练轮数：{epoch + 1}")
+
+
+# ============================================================
+# 37. TCN 最终测试
+# ============================================================
+
+tcn_model.eval()
+
+tcn_prediction_list = []
+tcn_target_list = []
+
+with torch.no_grad():
+    for batch_x, batch_future, batch_y in test_loader_plan:
+        prediction = tcn_model(
+            batch_x.to(device),
+            batch_future.to(device),
+        )
+
+        tcn_prediction_list.append(prediction.cpu())
+        tcn_target_list.append(batch_y)
+
+tcn_prediction_scaled = torch.cat(tcn_prediction_list, dim=0)
+tcn_target_scaled = torch.cat(tcn_target_list, dim=0)
+
+tcn_prediction_original = (
+    tcn_prediction_scaled * sales_std + sales_mean
+)
+
+tcn_target_original = (
+    tcn_target_scaled * sales_std + sales_mean
+)
+
+tcn_mae = torch.mean(
+    torch.abs(tcn_prediction_original - tcn_target_original)
+).item()
+
+tcn_mse = torch.mean(
+    (tcn_prediction_original - tcn_target_original) ** 2
+).item()
+
+tcn_rmse = math.sqrt(tcn_mse)
+
+print("\n===== TCN 测试结果 =====")
+print(f"MAE : {tcn_mae:.4f}")
+print(f"MSE : {tcn_mse:.4f}")
+print(f"RMSE: {tcn_rmse:.4f}")
+
+
+print("\n===== 模型对比 =====")
+print(f"Last Value Baseline MAE: {baseline_mae:.4f}")
+print(f"LSTM 实验 B MAE:        {plan_mae:.4f}")
+print(f"TCN MAE:                {tcn_mae:.4f}")
