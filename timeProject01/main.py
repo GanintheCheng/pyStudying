@@ -1491,3 +1491,119 @@ print("\n===== 模型对比 =====")
 print(f"Last Value Baseline MAE: {baseline_mae:.4f}")
 print(f"LSTM 实验 B MAE:        {plan_mae:.4f}")
 print(f"TCN MAE:                {tcn_mae:.4f}")
+
+# ============================================================
+# 38. 四组模型预测结果可视化
+# ============================================================
+
+plot_dates = pd.to_datetime(test_dates_plan)
+
+actual_values = target_original.squeeze().numpy()
+lstm_a_values = prediction_original.squeeze().numpy()
+lstm_b_values = plan_prediction_original.squeeze().numpy()
+tcn_values = tcn_prediction_original.squeeze().numpy()
+baseline_values = baseline_original.squeeze().numpy()
+
+fig, axes = plt.subplots(
+    2,
+    1,
+    figsize=(15, 10),
+    gridspec_kw={"height_ratios": [3, 1]},
+)
+
+# ------------------------------------------------------------
+# 图 1：测试集预测曲线
+# ------------------------------------------------------------
+axes[0].plot(
+    plot_dates,
+    actual_values,
+    label="Actual Sales",
+    color="black",
+    linewidth=2.2,
+)
+
+axes[0].plot(
+    plot_dates,
+    baseline_values,
+    label="Last Value Baseline",
+    color="tab:gray",
+    linestyle="--",
+    alpha=0.8,
+)
+
+axes[0].plot(
+    plot_dates,
+    lstm_a_values,
+    label="LSTM A: Unknown Future Price/Promotion",
+    color="tab:orange",
+    alpha=0.85,
+)
+
+axes[0].plot(
+    plot_dates,
+    lstm_b_values,
+    label="LSTM B: Known Future Price/Promotion",
+    color="tab:blue",
+    alpha=0.9,
+)
+
+axes[0].plot(
+    plot_dates,
+    tcn_values,
+    label="TCN: Known Future Price/Promotion",
+    color="tab:green",
+    alpha=0.9,
+)
+
+axes[0].set_title("Test Set Forecast Comparison")
+axes[0].set_xlabel("Date")
+axes[0].set_ylabel("Sales")
+axes[0].grid(alpha=0.3)
+axes[0].legend(ncol=2)
+
+
+# ------------------------------------------------------------
+# 图 2：MAE 对比柱状图
+# ------------------------------------------------------------
+model_names = [
+    "Baseline",
+    "LSTM A",
+    "LSTM B",
+    "TCN",
+]
+
+mae_values = [
+    baseline_mae,
+    mae,
+    plan_mae,
+    tcn_mae,
+]
+
+bar_colors = [
+    "tab:gray",
+    "tab:orange",
+    "tab:blue",
+    "tab:green",
+]
+
+bars = axes[1].bar(
+    model_names,
+    mae_values,
+    color=bar_colors,
+)
+
+axes[1].set_title("Test MAE Comparison")
+axes[1].set_ylabel("MAE")
+axes[1].grid(axis="y", alpha=0.3)
+
+for bar, value in zip(bars, mae_values):
+    axes[1].text(
+        bar.get_x() + bar.get_width() / 2,
+        value,
+        f"{value:.2f}",
+        ha="center",
+        va="bottom",
+    )
+
+plt.tight_layout()
+plt.show()
