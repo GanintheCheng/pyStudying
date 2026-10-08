@@ -3,8 +3,10 @@ import re
 
 import numpy as np
 import pandas as pd
-
-
+import torch
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 # ============================================================
 # 0. 配置
 # ============================================================
@@ -824,3 +826,596 @@ print(
         ["date", "sales", "sales_input"]
     ]
 )
+
+# ============================================================
+# 10. 训练集拟合标准化统计量
+# ============================================================
+def fit_scaler_from_train(train_df):
+    """
+    只读取训练集统计量。
+    sales 的统计量来自原始、非缺失目标值，
+    后续既用于 sales_input，也用于 sales 标签的标准化。
+    """
+
+    sales_train = train_df["sales"].dropna()
+    price_train = train_df["price"].dropna()
+
+    sales_mean = float(sales_train.mean())
+    sales_std = float(sales_train.std())
+
+    price_mean = float(price_train.mean())
+    price_std = float(price_train.std())
+
+    if sales_std == 0:
+        raise ValueError("训练集 sales 标准差为 0，无法标准化。")
+
+    if price_std == 0:
+        raise ValueError("训练集 price 标准差为 0，无法标准化。")
+
+    return {
+        "sales_mean": sales_mean,
+        "sales_std": sales_std,
+        "price_mean": price_mean,
+        "price_std": price_std
+    }
+
+
+# ============================================================
+# 11. 应用标准化
+# ============================================================
+def apply_scaler(df, scaler):
+    scaled_df = df.copy()
+
+    # 历史输入：供模型读取
+    scaled_df["sales_input_scaled"] = (
+        scaled_df["sales_input"] - scaler["sales_mean"]
+    ) / scaler["sales_std"]
+
+    scaled_df["price_input_scaled"] = (
+        scaled_df["price_input"] - scaler["price_mean"]
+    ) / scaler["price_std"]
+
+    # 训练标签：sales 缺失时结果仍是 NaN，这是正确的
+    scaled_df["sales_target_scaled"] = (
+        scaled_df["sales"] - scaler["sales_mean"]
+    ) / scaler["sales_std"]
+
+    # promotion / holiday 是 0/1 二值变量，不做标准化
+    return scaled_df
+
+
+# ============================================================
+# 12. 预测值还原为原始销量尺度
+# ============================================================
+def inverse_sales_scale(scaled_values, scaler):
+    """
+    可接收 numpy 数组、Tensor 或普通数值。
+    """
+    return (
+        scaled_values * scaler["sales_std"]
+        + scaler["sales_mean"]
+    )
+
+# --------------------------------------------------------
+# H. 只基于训练集拟合标准化统计量
+# --------------------------------------------------------
+scaler = fit_scaler_from_train(train_ready)
+
+print("\n===== 训练集标准化统计量 =====")
+print(f"sales_mean = {scaler['sales_mean']:.4f}")
+print(f"sales_std  = {scaler['sales_std']:.4f}")
+print(f"price_mean = {scaler['price_mean']:.4f}")
+print(f"price_std  = {scaler['price_std']:.4f}")
+
+# --------------------------------------------------------
+# I. 使用同一套统计量变换三个数据集
+# --------------------------------------------------------
+train_scaled = apply_scaler(train_ready, scaler)
+val_scaled = apply_scaler(val_ready, scaler)
+test_scaled = apply_scaler(test_ready, scaler)
+
+print("\n===== 标准化后训练集检查 =====")
+print(
+    "sales_target_scaled mean:",
+    round(
+        train_scaled["sales_target_scaled"].mean(),
+        4
+    )
+)
+
+print(
+    "sales_target_scaled std: ",
+    round(
+        train_scaled["sales_target_scaled"].std(),
+        4
+    )
+)
+
+print(
+    "price_input_scaled mean:",
+    round(
+        train_scaled["price_input_scaled"].mean(),
+        4
+    )
+)
+
+print(
+    "price_input_scaled std: ",
+    round(
+        train_scaled["price_input_scaled"].std(),
+        4
+    )
+)
+
+# ============================================================
+# 13. 日期特征工程
+# ============================================================
+def add_calendar_features(df, time_column="date"):
+    result_df = df.copy()
+
+    # 确保日期列为 datetime 类型
+    result_df[time_column] = pd.to_datetime(
+        result_df[time_column]
+    )
+
+    # 0=周一，...，6=周日
+    result_df["day_of_week"] = (
+        result_df[time_column].dt.dayofweek
+    )
+
+    # 固定创建 7 列，保证 train / val / test 特征列完全一致
+    for day in range(7):
+        result_df[f"day_of_week_{day}"] = (
+            result_df["day_of_week"] == day
+        ).astype(np.float32)
+
+    return result_df
+
+# --------------------------------------------------------
+# J. 从日期构造未来已知日历特征
+# --------------------------------------------------------
+train_feature_df = add_calendar_features(train_scaled)
+val_feature_df = add_calendar_features(val_scaled)
+test_feature_df = add_calendar_features(test_scaled)
+
+print("\n===== 日期特征示例 =====")
+print(
+    train_feature_df[
+        [
+            "date",
+            "day_of_week",
+            "day_of_week_0",
+            "day_of_week_1",
+            "day_of_week_2",
+            "day_of_week_3",
+            "day_of_week_4",
+            "day_of_week_5",
+            "day_of_week_6"
+        ]
+    ].head(10)
+)
+
+# ============================================================
+# 14. 构造带有未来已知变量的时间序列窗口
+# ============================================================
+def build_time_series_windows(
+    full_df,
+    history_feature_columns,
+    future_known_feature_columns,
+    target_column,
+    start_target_index,
+    end_target_index,
+    input_length=14,
+    forecast_horizon=1
+):
+    """
+    full_df：
+        已按时间升序排列的完整特征表。
+
+    start_target_index / end_target_index：
+        规定“预测目标 y”属于哪个数据集。
+        例如验证集目标虽然从验证区间开始，
+        但历史窗口 X 可以使用训练集末尾的日期。
+
+    返回：
+        X: (N, input_length, 历史特征数)
+        Z: (N, forecast_horizon, 未来已知特征数)
+        y: (N, forecast_horizon, 1)
+        target_dates: 每个样本对应的目标日期
+    """
+
+    x_list = []
+    future_list = []
+    y_list = []
+    target_dates = []
+
+    # target_index 指的是第一个预测目标所在的位置
+    for target_index in range(
+        start_target_index,
+        end_target_index - forecast_horizon + 1
+    ):
+        history_start = target_index - input_length
+        history_end = target_index
+
+        # 若历史不足 input_length 天，则跳过
+        if history_start < 0:
+            continue
+
+        # X：过去 input_length 天
+        x_window = full_df.iloc[
+            history_start:history_end
+        ][history_feature_columns]
+
+        # Z：预测日及后续 forecast_horizon 天已知的信息
+        future_window = full_df.iloc[
+            target_index:target_index + forecast_horizon
+        ][future_known_feature_columns]
+
+        # y：预测日及后续 forecast_horizon 天的目标值
+        y_window = full_df.iloc[
+            target_index:target_index + forecast_horizon
+        ][target_column]
+
+        # 任何模型输入或训练标签存在缺失，就不构造该样本
+        if (
+            x_window.isna().any().any()
+            or future_window.isna().any().any()
+            or y_window.isna().any().any()
+        ):
+            continue
+
+        x_list.append(
+            x_window.to_numpy(dtype=np.float32)
+        )
+
+        future_list.append(
+            future_window.to_numpy(dtype=np.float32)
+        )
+
+        y_list.append(
+            y_window.to_numpy(dtype=np.float32)
+        )
+
+        target_dates.append(
+            full_df.iloc[target_index]["date"]
+        )
+
+    n_history_features = len(history_feature_columns)
+    n_future_features = len(future_known_feature_columns)
+
+    # 防止没有有效样本时 torch.tensor([]) 形状混乱
+    if len(x_list) == 0:
+        empty_x = torch.empty(
+            (0, input_length, n_history_features),
+            dtype=torch.float32
+        )
+
+        empty_future = torch.empty(
+            (0, forecast_horizon, n_future_features),
+            dtype=torch.float32
+        )
+
+        empty_y = torch.empty(
+            (0, forecast_horizon, 1),
+            dtype=torch.float32
+        )
+
+        return empty_x, empty_future, empty_y, target_dates
+
+    x_tensor = torch.tensor(
+        np.array(x_list),
+        dtype=torch.float32
+    )
+
+    future_tensor = torch.tensor(
+        np.array(future_list),
+        dtype=torch.float32
+    )
+
+    # 原来形状：(N, forecast_horizon)
+    # 增加最后一维，表示只有一个预测目标 sales
+    y_tensor = torch.tensor(
+        np.array(y_list),
+        dtype=torch.float32
+    ).unsqueeze(-1)
+
+    return x_tensor, future_tensor, y_tensor, target_dates
+
+# --------------------------------------------------------
+# K. 指定后续模型实际读取的特征列
+# --------------------------------------------------------
+history_feature_columns = [
+    "sales_input_scaled",
+    "price_input_scaled",
+    "promotion",
+    "holiday",
+    "day_of_week_0",
+    "day_of_week_1",
+    "day_of_week_2",
+    "day_of_week_3",
+    "day_of_week_4",
+    "day_of_week_5",
+    "day_of_week_6"
+]
+
+future_known_feature_columns = [
+    "holiday",
+    "day_of_week_0",
+    "day_of_week_1",
+    "day_of_week_2",
+    "day_of_week_3",
+    "day_of_week_4",
+    "day_of_week_5",
+    "day_of_week_6"
+]
+
+target_column = "sales_target_scaled"
+
+input_length = 14
+forecast_horizon = task_config["forecast_horizon"]
+
+# --------------------------------------------------------
+# L. 拼回完整时间线，以便验证集和测试集窗口能使用此前历史
+# --------------------------------------------------------
+full_feature_df = pd.concat(
+    [train_feature_df, val_feature_df, test_feature_df],
+    ignore_index=True
+).sort_values("date").reset_index(drop=True)
+
+train_end_index = len(train_feature_df)
+val_end_index = train_end_index + len(val_feature_df)
+test_end_index = len(full_feature_df)
+
+# --------------------------------------------------------
+# M. 构造三个集合的窗口
+# --------------------------------------------------------
+train_x, train_future, train_y, train_dates = (
+    build_time_series_windows(
+        full_df=full_feature_df,
+        history_feature_columns=history_feature_columns,
+        future_known_feature_columns=future_known_feature_columns,
+        target_column=target_column,
+        start_target_index=0,
+        end_target_index=train_end_index,
+        input_length=input_length,
+        forecast_horizon=forecast_horizon
+    )
+)
+
+val_x, val_future, val_y, val_dates = (
+    build_time_series_windows(
+        full_df=full_feature_df,
+        history_feature_columns=history_feature_columns,
+        future_known_feature_columns=future_known_feature_columns,
+        target_column=target_column,
+        start_target_index=train_end_index,
+        end_target_index=val_end_index,
+        input_length=input_length,
+        forecast_horizon=forecast_horizon
+    )
+)
+
+test_x, test_future, test_y, test_dates = (
+    build_time_series_windows(
+        full_df=full_feature_df,
+        history_feature_columns=history_feature_columns,
+        future_known_feature_columns=future_known_feature_columns,
+        target_column=target_column,
+        start_target_index=val_end_index,
+        end_target_index=test_end_index,
+        input_length=input_length,
+        forecast_horizon=forecast_horizon
+    )
+)
+
+print("\n===== 滑动窗口形状 =====")
+print("历史特征数：", len(history_feature_columns))
+print("未来已知特征数：", len(future_known_feature_columns))
+
+print("train_x:     ", train_x.shape)
+print("train_future:", train_future.shape)
+print("train_y:     ", train_y.shape)
+
+print("val_x:       ", val_x.shape)
+print("val_future:  ", val_future.shape)
+print("val_y:       ", val_y.shape)
+
+print("test_x:      ", test_x.shape)
+print("test_future: ", test_future.shape)
+print("test_y:      ", test_y.shape)
+
+print("\n===== 第一个训练样本 =====")
+print("预测目标日期：", train_dates[0].date())
+print("X 的形状：", train_x[0].shape)
+print("Z 的形状：", train_future[0].shape)
+print("y 的形状：", train_y[0].shape)
+
+# ============================================================
+# 15. 为传统机器学习模型准备输入
+# ============================================================
+def flatten_window_features(x_tensor, future_tensor):
+    """
+    将时序窗口展平给传统模型使用。
+
+    原始：
+    x_tensor      : (N, 14, 11)
+    future_tensor : (N, 1, 8)
+
+    展平并拼接后：
+    X_flat        : (N, 14 * 11 + 1 * 8)
+                  = (N, 162)
+    """
+    x_array = x_tensor.cpu().numpy()
+    future_array = future_tensor.cpu().numpy()
+
+    x_flat = x_array.reshape(x_array.shape[0], -1)
+    future_flat = future_array.reshape(
+        future_array.shape[0],
+        -1
+    )
+
+    return np.concatenate([x_flat, future_flat], axis=1)
+
+
+# ============================================================
+# 16. 将标准化销量还原为原始销量
+# ============================================================
+def inverse_sales_numpy(values_scaled, scaler):
+    return (
+        values_scaled * scaler["sales_std"]
+        + scaler["sales_mean"]
+    )
+
+
+# ============================================================
+# 17. 计算原始销量尺度上的回归指标
+# ============================================================
+def calculate_regression_metrics(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+
+    return {
+        "MAE": mae,
+        "MSE": mse,
+        "RMSE": rmse
+    }
+
+
+# ============================================================
+# 18. 自动模型选择：只使用验证集决定排名
+# ============================================================
+def run_model_selection(
+    train_x,
+    train_future,
+    train_y,
+    val_x,
+    val_future,
+    val_y,
+    scaler
+):
+    # 给传统模型的展平输入
+    train_X_flat = flatten_window_features(
+        train_x,
+        train_future
+    )
+
+    val_X_flat = flatten_window_features(
+        val_x,
+        val_future
+    )
+
+    # y 原来是 (N, 1, 1)，压平为 (N,)
+    train_y_scaled = train_y.cpu().numpy().reshape(-1)
+    val_y_scaled = val_y.cpu().numpy().reshape(-1)
+
+    # 还原到真实销量尺度，用于最终 MAE / MSE / RMSE
+    val_y_original = inverse_sales_numpy(
+        val_y_scaled,
+        scaler
+    )
+
+    results = []
+    trained_models = {}
+
+    # --------------------------------------------------------
+    # 候选 1：最后一个销量值 Baseline
+    # train_x[:, -1, 0]：
+    # 最后一个历史时间点的第 0 个特征，即 sales_input_scaled
+    # --------------------------------------------------------
+    baseline_pred_scaled = (
+        val_x[:, -1, 0]
+        .cpu()
+        .numpy()
+    )
+
+    baseline_pred_original = inverse_sales_numpy(
+        baseline_pred_scaled,
+        scaler
+    )
+
+    baseline_metrics = calculate_regression_metrics(
+        val_y_original,
+        baseline_pred_original
+    )
+
+    results.append({
+        "model": "Last Value Baseline",
+        **baseline_metrics
+    })
+
+    # --------------------------------------------------------
+    # 候选 2~4：传统回归模型
+    # --------------------------------------------------------
+    candidate_models = {
+        "Linear Regression": LinearRegression(),
+
+        "Ridge Regression": Ridge(
+            alpha=1.0
+        ),
+
+        "Random Forest": RandomForestRegressor(
+            n_estimators=200,
+            max_depth=8,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1
+        )
+    }
+
+    for model_name, model in candidate_models.items():
+        # 只在训练集拟合
+        model.fit(train_X_flat, train_y_scaled)
+
+        # 在验证集预测
+        val_pred_scaled = model.predict(val_X_flat)
+
+        # 将预测还原为原始销量尺度
+        val_pred_original = inverse_sales_numpy(
+            val_pred_scaled,
+            scaler
+        )
+
+        metrics = calculate_regression_metrics(
+            val_y_original,
+            val_pred_original
+        )
+
+        results.append({
+            "model": model_name,
+            **metrics
+        })
+
+        trained_models[model_name] = model
+
+    leaderboard = (
+        pd.DataFrame(results)
+        .sort_values("MAE")
+        .reset_index(drop=True)
+    )
+
+    return leaderboard, trained_models
+
+
+# ============================================================
+# 19. 运行候选模型并输出验证集排行榜
+# ============================================================
+leaderboard, trained_models = run_model_selection(
+    train_x=train_x,
+    train_future=train_future,
+    train_y=train_y,
+    val_x=val_x,
+    val_future=val_future,
+    val_y=val_y,
+    scaler=scaler
+)
+
+print("\n===== 验证集模型排行榜 =====")
+print(leaderboard.to_string(
+    index=False,
+    float_format=lambda value: f"{value:.4f}"
+))
+
+best_model_name = leaderboard.iloc[0]["model"]
+
+print("\n验证集最优候选模型：", best_model_name)
