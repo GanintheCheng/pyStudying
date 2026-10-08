@@ -664,3 +664,163 @@ if __name__ == "__main__":
     print("\nWarnings：")
     for warning in clean_check["warnings"]:
         print("-", warning)
+
+
+# ============================================================
+# 7. 按时间顺序划分训练、验证、测试集
+# ============================================================
+def split_time_series(
+    df,
+    train_ratio=0.70,
+    val_ratio=0.15
+):
+    """
+    输入 df 必须已经：
+    1. 按日期升序排列；
+    2. 每个日期只有一条记录。
+    """
+    n_samples = len(df)
+
+    train_end = int(n_samples * train_ratio)
+    val_end = train_end + int(n_samples * val_ratio)
+
+    train_df = df.iloc[:train_end].copy()
+    val_df = df.iloc[train_end:val_end].copy()
+    test_df = df.iloc[val_end:].copy()
+
+    return train_df, val_df, test_df
+
+
+# ============================================================
+# 8. 输出各集合的时间范围
+# ============================================================
+def print_split_summary(train_df, val_df, test_df, time_column):
+    print("\n===== 时间序列数据划分 =====")
+
+    for name, split_df in [
+        ("训练集", train_df),
+        ("验证集", val_df),
+        ("测试集", test_df)
+    ]:
+        print(
+            f"{name}：{len(split_df)} 条，"
+            f"{split_df[time_column].min().date()} 至 "
+            f"{split_df[time_column].max().date()}"
+        )
+
+# --------------------------------------------------------
+# F. 时间序列划分：必须在填补与标准化之前完成
+# --------------------------------------------------------
+train_df, val_df, test_df = split_time_series(
+    clean_df,
+    train_ratio=0.70,
+    val_ratio=0.15
+)
+
+print_split_summary(
+    train_df,
+    val_df,
+    test_df,
+    time_column=task_config["time_column"]
+)
+
+# ============================================================
+# 9. 因果填补：只能从过去向未来填补
+# ============================================================
+def causal_impute_splits(train_df, val_df, test_df):
+    """
+    保留原始 target（sales）不变；
+    创建供模型输入使用的 sales_input 与 price_input。
+
+    ffill 的方向是过去 -> 未来。
+    因此验证集可以使用训练集最后一个已知值，
+    测试集可以使用训练集、验证集及测试集此前已知值。
+    """
+
+    train_part = train_df.copy()
+    val_part = val_df.copy()
+    test_part = test_df.copy()
+
+    train_part["split"] = "train"
+    val_part["split"] = "val"
+    test_part["split"] = "test"
+
+    # 保证按完整时间线前向填补，
+    # 但不会使用任何未来日期的数据。
+    full_df = pd.concat(
+        [train_part, val_part, test_part],
+        ignore_index=True
+    ).sort_values("date").reset_index(drop=True)
+
+    # 原始 sales 列保持不变，只新增输入列
+    full_df["sales_input"] = full_df["sales"].ffill()
+
+    # 原始 price 列保持不变，只新增输入列
+    full_df["price_input"] = full_df["price"].ffill()
+
+    # 如果第一天恰好缺失，ffill 无法填补；
+    # 这种情况不能用未来值 bfill，应保留 NaN 并在构造窗口时跳过。
+    initial_sales_missing = int(
+        full_df["sales_input"].isna().sum()
+    )
+
+    initial_price_missing = int(
+        full_df["price_input"].isna().sum()
+    )
+
+    if initial_sales_missing > 0:
+        print(
+            "警告：sales_input 开头仍有缺失值，"
+            "后续需要跳过无法构造历史窗口的样本。"
+        )
+
+    if initial_price_missing > 0:
+        print(
+            "警告：price_input 开头仍有缺失值，"
+            "后续需要跳过无法构造历史窗口的样本。"
+        )
+
+    # 重新拆回三个集合
+    train_ready = full_df[
+        full_df["split"] == "train"
+    ].copy()
+
+    val_ready = full_df[
+        full_df["split"] == "val"
+    ].copy()
+
+    test_ready = full_df[
+        full_df["split"] == "test"
+    ].copy()
+
+    # 之后不再需要 split 辅助列
+    for split_df in [train_ready, val_ready, test_ready]:
+        split_df.drop(columns=["split"], inplace=True)
+
+    return train_ready, val_ready, test_ready
+# --------------------------------------------------------
+# G. 因果填补：创建模型输入列
+# --------------------------------------------------------
+train_ready, val_ready, test_ready = causal_impute_splits(
+    train_df,
+    val_df,
+    test_df
+)
+
+print("\n===== 因果填补后缺失值 =====")
+print("\n训练集：")
+print(train_ready.isna().sum())
+
+print("\n验证集：")
+print(val_ready.isna().sum())
+
+print("\n测试集：")
+print(test_ready.isna().sum())
+
+print("\n===== 原 sales 缺失时的处理方式 =====")
+print(
+    train_ready.loc[
+        train_ready["sales"].isna(),
+        ["date", "sales", "sales_input"]
+    ]
+)
